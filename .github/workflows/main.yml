@@ -1,0 +1,110 @@
+name: 20 Shards Load Test
+
+on:
+  workflow_dispatch:
+    inputs:
+      url:
+        description: 'Target URL (http:// or https://)'
+        required: true
+      duration:
+        description: 'Duration in seconds (integer)'
+        required: true
+        default: '600'
+      rate_per_shard:
+        description: 'Requests per 300ms per connection loop'
+        required: true
+        default: '30'
+      threads:
+        description: 'Total concurrent connection loops per shard (capped by CPU)'
+        required: true
+        default: '5000'
+      use_http:
+        description: 'Use plain HTTP (h2c) instead of HTTPS'
+        type: boolean
+        required: true
+        default: false
+
+env:
+  NODE_OPTIONS: "--max-old-space-size=4096"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Verify entrypoint syntax
+        run: |
+          node --check index.js
+          node -e "const p=require('./package.json'); console.log('main =', p.main || 'index.js');"
+
+      - name: Upload source artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tool-src
+          path: |
+            index.js
+            package.json
+            package-lock.json
+          if-no-files-found: ignore
+
+  load:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10,
+                11, 12, 13, 14, 15, 16, 17, 18, 19, 20]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tool-src
+          path: ./
+
+      - name: Split proxy list for shard
+        env:
+          SHARD_ID: ${{ matrix.shard }}
+        run: |
+          if [ ! -f proxy.txt ]; then
+            echo "[!] proxy.txt missing"; exit 1
+          fi
+          awk -v s="$SHARD_ID" -v t="20" '((NR-1) % t) == (s-1)' proxy.txt > proxy_shard.txt
+          echo "shard=$SHARD_ID proxy_lines=$(grep -cve '^\s*$' proxy_shard.txt || true)"
+
+      - name: Run tool
+        env:
+          TARGET:  ${{ inputs.url }}
+          DURATION: ${{ inputs.duration }}
+          RATE:     ${{ inputs.rate_per_shard }}
+          THREADS:  ${{ inputs.threads }}
+          SHARD_ID: ${{ matrix.shard }}
+          USE_HTTP: ${{ inputs.use_http }}
+        run: |
+          FLAG=""
+          if [ "$USE_HTTP" = "true" ]; then FLAG="--http"; fi
+
+          echo "[>] node index.js \"$TARGET\" \"$DURATION\" \"$RATE\" \"$THREADS\" proxy_shard.txt $FLAG"
+
+          node index.js "$TARGET" "$DURATION" "$RATE" "$THREADS" proxy_shard.txt $FLAG \
+            2>&1 | tee "output_shard_${SHARD_ID}.log"
+
+      - name: Upload shard log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-shard-${{ matrix.shard }}
+          path: output_shard_${{ matrix.shard }}.log
+          if-no-files-found: warn
